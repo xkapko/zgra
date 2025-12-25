@@ -1,15 +1,19 @@
 const std = @import("std");
 const zgra = @import("zgra");
 
-const Template = struct {
+const Args = struct {
     _help: bool,
     _version: bool,
     _xd: bool,
-    num: i32,
-    flt: f32,
+    int: i128,
+    uint: u64,
+    flt: f16,
     msg: [:0]const u8,
+    msg2: [:0]u8,
+    msg3: []const u8,
+    msg4: []u8,
 };
-const Parser = zgra.MakeParser(Template);
+const Parser = zgra.MakeParser(Args);
 
 pub fn main() !void {
     var it = std.process.ArgIterator.init();
@@ -17,9 +21,13 @@ pub fn main() !void {
         ._help = false,
         ._version = false,
         ._xd = false,
-        .num = 0,
+        .int = 0,
+        .uint = 0,
         .flt = 0.0,
         .msg = "",
+        .msg2 = @constCast(""),
+        .msg3 = "",
+        .msg4 = "",
     } };
     const res = try parser.parse(&it);
 

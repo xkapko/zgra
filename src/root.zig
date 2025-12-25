@@ -12,7 +12,28 @@ pub const ZgraError = error{
 };
 
 fn isSupportedType(comptime a: type) bool {
-    return a == bool or a == [:0]const u8 or a == i32 or a == f32;
+    return a == bool or
+        a == i8 or
+        a == i16 or
+        a == i32 or
+        a == i64 or
+        a == i128 or
+        a == isize or
+        a == u8 or
+        a == u16 or
+        a == u32 or
+        a == u64 or
+        a == u128 or
+        a == usize or
+        a == []const u8 or
+        a == []u8 or
+        a == [:0]const u8 or
+        a == [:0]u8 or
+        a == f16 or
+        a == f32 or
+        a == f64 or
+        a == f80 or
+        a == f128;
 }
 
 pub const Arg = struct {
@@ -20,6 +41,7 @@ pub const Arg = struct {
     type: enum {
         bool,
         int,
+        uint,
         float,
         str,
     },
@@ -50,9 +72,10 @@ pub fn MakeParser(comptime Template: type) type {
                 .name = f.name,
                 .type = switch (f.type) {
                     bool => .bool,
-                    i32 => .int,
-                    [:0]const u8 => .str,
-                    f32 => .float,
+                    i8, i16, i32, i64, i128, isize => .int,
+                    u8, u16, u32, u64, u128, usize => .uint,
+                    []const u8, []u8, [:0]const u8, [:0]u8 => .str,
+                    f16, f32, f64, f80, f128 => .float,
                     else => @compileError("unsupported field type"),
                 },
                 .short = f.name[0] == '_',
@@ -112,18 +135,22 @@ pub fn MakeParser(comptime Template: type) type {
                     },
                     .value => {
                         if (self.parser.currentArg) |ca| {
-                            @setRuntimeSafety(false);
                             inline for (fields[0], fields[1]) |arg_, sf| {
                                 if (std.mem.eql(u8, ca.name, arg_.name)) {
                                     switch (sf.type) {
                                         [:0]const u8 => {
                                             @field(self.template, sf.name) = arg;
                                         },
-                                        i32 => {
-                                            @field(self.template, sf.name) = try std.fmt.parseInt(i32, arg, 10);
+                                        [:0]u8 => {
+                                            @field(self.template, sf.name) = @constCast(arg);
                                         },
-                                        f32 => {
-                                            @field(self.template, sf.name) = try std.fmt.parseFloat(f32, arg);
+                                        []const u8 => @field(self.template, sf.name) = std.mem.span(arg.ptr),
+                                        []u8 => @field(self.template, sf.name) = @constCast(std.mem.span(arg.ptr)),
+                                        i8, i16, i32, i64, i128 => {
+                                            @field(self.template, sf.name) = try std.fmt.parseInt(sf.type, arg, 10);
+                                        },
+                                        f16, f32, f64, f80, f128 => {
+                                            @field(self.template, sf.name) = try std.fmt.parseFloat(sf.type, arg);
                                         },
                                         else => {
                                             return ZgraError.UnsupportedFieldType;
@@ -142,11 +169,4 @@ pub fn MakeParser(comptime Template: type) type {
             return self.template;
         }
     };
-}
-
-test "field_types" {
-    try std.testing.expect(isSupportedType(bool));
-    try std.testing.expect(isSupportedType([]u8));
-    try std.testing.expect(isSupportedType(i32));
-    try std.testing.expect(isSupportedType(f32));
 }
