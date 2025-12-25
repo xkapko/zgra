@@ -12,6 +12,7 @@ const Args = struct {
     msg2: [:0]u8,
     msg3: []const u8,
     msg4: []u8,
+    opt: ?bool = null,
 };
 const Parser = zgra.MakeParser(Args);
 

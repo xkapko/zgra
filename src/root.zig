@@ -11,31 +11,6 @@ pub const ZgraError = error{
     InvalidCharacter,
 };
 
-fn isSupportedType(comptime a: type) bool {
-    return a == bool or
-        a == i8 or
-        a == i16 or
-        a == i32 or
-        a == i64 or
-        a == i128 or
-        a == isize or
-        a == u8 or
-        a == u16 or
-        a == u32 or
-        a == u64 or
-        a == u128 or
-        a == usize or
-        a == []const u8 or
-        a == []u8 or
-        a == [:0]const u8 or
-        a == [:0]u8 or
-        a == f16 or
-        a == f32 or
-        a == f64 or
-        a == f80 or
-        a == f128;
-}
-
 pub const Arg = struct {
     name: [:0]const u8,
     type: enum {
@@ -46,6 +21,7 @@ pub const Arg = struct {
         str,
     },
     short: bool,
+    optional: bool,
 };
 
 pub const Zgra = struct {
@@ -56,21 +32,19 @@ pub const Zgra = struct {
     } = .arg,
 };
 
-// first support only structs
-//      1. bool fields - flags
-//      2. string, int, double - options
 pub fn MakeParser(comptime Template: type) type {
     const info = @typeInfo(Template).@"struct";
     const fields = comptime make_fields: {
         var fields: [info.fields.len]Arg = undefined;
         var sfields: [info.fields.len]StructField = undefined;
         for (info.fields, 0..) |f, i| {
-            if (!isSupportedType(f.type)) {
-                @compileError("unsupported field type");
-            }
+            const optionalField = switch (@typeInfo(f.type)) {
+                .optional => |x| .{ x.child, true },
+                else => .{ f.type, false },
+            };
             fields[i] = Arg{
                 .name = f.name,
-                .type = switch (f.type) {
+                .type = switch (optionalField[0]) {
                     bool => .bool,
                     i8, i16, i32, i64, i128, isize => .int,
                     u8, u16, u32, u64, u128, usize => .uint,
@@ -79,6 +53,7 @@ pub fn MakeParser(comptime Template: type) type {
                     else => @compileError("unsupported field type"),
                 },
                 .short = f.name[0] == '_',
+                .optional = optionalField[1],
             };
             sfields[i] = f;
         }
@@ -137,7 +112,11 @@ pub fn MakeParser(comptime Template: type) type {
                         if (self.parser.currentArg) |ca| {
                             inline for (fields[0], fields[1]) |arg_, sf| {
                                 if (std.mem.eql(u8, ca.name, arg_.name)) {
-                                    switch (sf.type) {
+                                    const argumentType = switch (@typeInfo(sf.type)) {
+                                        .optional => |o| o.child,
+                                        else => sf.type,
+                                    };
+                                    switch (argumentType) {
                                         [:0]const u8 => {
                                             @field(self.template, sf.name) = arg;
                                         },
