@@ -13,7 +13,27 @@ pub const ZgraError = error{
     InvalidCharacter,
     WriteFailed,
     UnknownEnumVariant,
+    OutOfMemory,
     NoSpaceLeft,
+    WrongNumberOfArguments,
+    OptionAfterPositional,
+};
+
+const PosKind = union(enum) {
+    exact: struct {
+        n: usize,
+    },
+    many_zero,
+    many_one,
+};
+
+const ArgType = enum {
+    bool,
+    int,
+    uint,
+    float,
+    str,
+    enume,
 };
 
 /// Inner representation of a parsed command line argument.
@@ -21,19 +41,14 @@ const Arg = struct {
     // name of the argument
     name: [:0]const u8,
     // type of the argument, used for parsing
-    type: enum {
-        bool,
-        int,
-        uint,
-        float,
-        str,
-        enume,
-    },
+    type: ArgType,
     values: ?[]const [:0]const u8 = null,
     short: bool,
-    optional: bool,
     skip: bool,
     help: []u8 = "",
+    positional: ?struct {
+        kind: PosKind,
+    } = null,
 };
 
 /// Program metadata such as the program name, version, usage info and short program description.
@@ -51,36 +66,59 @@ const Parser = struct {
     state: enum {
         arg,
         value,
+        positional,
     } = .arg,
-};
-
-/// This type is used to automatically generate help messages for the commands you use.
-pub const ZgraHelp = struct {
-    items: []const ZgraArg,
-};
-
-/// Used to provide a help message to an argument.
-pub const ZgraArg = struct {
-    name: []const u8,
-    help: []const u8,
 };
 
 /// Given a type and a help structure, create a new command line argument parser at compile time. After creating the
 /// parsers, the user needs to instantiate it with the default values and then call the `.parse()` method on the
 /// instance. The returned value is the initial type with with the values of each field matching the ones received from
 /// parsing.
-pub fn MakeParser(comptime Template: type, helpInfo: ZgraHelp) type {
-    const info = @typeInfo(Template).@"struct";
-    const comptimeState = comptime make_fields: {
+pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
+    const template_type_info = @typeInfo(Template);
+    const info = switch (template_type_info) {
+        .@"struct" => |s| s,
+        else => @compileError("Template is not a struct"),
+    };
+
+    const args, const struct_fields, const metadata, const index, const pos_type = comptime make_state: {
         var args: [info.fields.len]Arg = undefined;
-        var structFields: [info.fields.len]StructField = undefined;
-        var meta: ZgraMeta = .{};
+        var template_fields: [info.fields.len]StructField = undefined;
+        var metadata: ZgraMeta = .{};
+        var positional_index: ?usize = null;
+        var positional_type: ?type = null;
         for (
             info.fields,
             0..,
         ) |f, i| {
-            const optionalField = switch (@typeInfo(f.type)) {
-                .optional => |x| .{ x.child, true, null },
+            const field_type_info = @typeInfo(f.type);
+
+            const is_positional, const name, const kind, const field_type = helpers.parsePositionalArgument(f);
+            if (is_positional and positional_index == null) {
+                positional_index = i;
+                positional_type = field_type;
+            } else if (is_positional and positional_index != null) {
+                @compileError("more than one positional argumet is not allowed");
+            }
+
+            const skip = helpers.parseMetaArg(&metadata, f);
+
+            const arg_type = switch (field_type) {
+                bool => .bool,
+                i8, i16, i32, i64, i128, isize => .int,
+                u8, u16, u32, u64, u128, usize => .uint,
+                []const u8, []u8, [:0]const u8, [:0]u8 => .str,
+                f16, f32, f64, f80, f128 => .float,
+                else => switch (field_type_info) {
+                    .@"enum" => .enume,
+                    else => |x| {
+                        @compileLog("unsupported struct field type: {any}", .{x});
+                        @compileError("unsupported field type");
+                    },
+                },
+            };
+
+            const values = switch (field_type_info) {
                 .@"enum" => |e| enfields: {
                     const efields = blk: {
                         var tmp: [e.fields.len][:0]const u8 = undefined;
@@ -89,225 +127,300 @@ pub fn MakeParser(comptime Template: type, helpInfo: ZgraHelp) type {
                         }
                         break :blk tmp;
                     };
-                    break :enfields .{ f.type, false, &efields };
+                    break :enfields &efields;
                 },
-                else => .{ f.type, false, null },
+                else => null,
             };
-            const help = eql(u8, "__desc", f.name);
-            const usage = eql(u8, "__usage", f.name);
-            const version = eql(u8, "__version", f.name);
-            const program = eql(u8, "__program", f.name);
-            const skip = help or version or usage or program;
-            // meta arguments
-            if (help) {
-                meta.description = f.defaultValue().?;
-            } else if (version) {
-                meta.version = f.defaultValue().?;
-            } else if (usage) {
-                meta.usage = f.defaultValue().?;
-            } else if (program) {
-                meta.program = f.defaultValue().?;
-            } else if (f.name.len > 2 and f.name[0] == '_' and f.name[1] == '_') {
-                @compileError("not a supported meta value: " ++ f.name);
-            }
 
-            // regular arguments
             args[i] = Arg{
-                .name = f.name,
-                .type = switch (optionalField[0]) {
-                    bool => .bool,
-                    i8, i16, i32, i64, i128, isize => .int,
-                    u8, u16, u32, u64, u128, usize => .uint,
-                    []const u8, []u8, [:0]const u8, [:0]u8 => .str,
-                    f16, f32, f64, f80, f128 => .float,
-                    else => switch (@typeInfo(optionalField[0])) {
-                        .@"enum" => .enume,
-                        else => |x| {
-                            @compileLog("unsupported type: {any}", .{x});
-                            @compileError("unsupported field type");
-                        },
-                    },
-                },
+                .name = if (is_positional) name else f.name,
+                .type = arg_type,
                 .short = f.name[0] == '_',
-                .optional = optionalField[1],
-                .skip = skip,
-                .help = getinfo: {
-                    for (helpInfo.items) |ai| {
-                        if (eql(u8, ai.name, f.name)) {
-                            break :getinfo @constCast(ai.help);
-                        }
-                    }
-                    break :getinfo "";
+                .skip = skip or is_positional,
+                .help = switch (skip or is_positional) {
+                    true => "",
+                    else => @constCast(@field(helpInfo, f.name)),
                 },
-                .values = optionalField[2],
+                .values = values,
+                .positional = if (is_positional) .{
+                    .kind = kind,
+                } else null,
             };
-            structFields[i] = f;
+            template_fields[i] = f;
         }
-        break :make_fields .{ args, structFields, meta };
+        break :make_state .{
+            args,
+            template_fields,
+            metadata,
+            positional_index,
+            positional_type,
+        };
     };
+    const return_type = if (pos_type == null) ZgraError!struct { Template } else ZgraError!struct { Template, []pos_type.? };
+    const include_alist = pos_type != null;
+
     return struct {
         parser: Parser = .{},
-        meta: ZgraMeta = comptimeState[2],
+        meta: ZgraMeta = metadata,
         template: Template,
+        alist: if (include_alist)
+            std.ArrayList(pos_type.?)
+        else
+            void = if (include_alist) .empty else {},
 
-        pub fn parse(self: *@This(), it: *std.process.ArgIterator, w: *std.Io.Writer) ZgraError!Template {
-            self.parser.state = .arg;
+        pub fn parse(self: *@This(), it: *std.process.ArgIterator, w: *std.Io.Writer, alloc: *std.mem.Allocator) return_type {
             // skip program name
+            var pos_arg_count: usize = 0;
             _ = it.next();
             while (it.next()) |arg| {
                 switch (self.parser.state) {
                     .arg => {
-                        if (eql(
-                            u8,
-                            "--",
-                            arg[0..2],
-                        )) {
-                            if (eql(u8, "--help", arg)) {
-                                try self.help(w);
-                            }
-                            if (eql(u8, "--version", arg)) {
-                                try self.version(w);
-                            }
-                            inline for (comptimeState[0], comptimeState[1]) |arg_, sf| {
-                                if (eql(u8, arg_.name, arg[2..])) {
-                                    switch (arg_.type) {
-                                        .bool => @field(self.template, sf.name) = true,
-                                        else => {
-                                            self.parser.currentArg = arg_;
-                                            self.parser.state = .value;
-                                        },
-                                    }
-                                    break;
-                                }
-                            }
-                        } else if (arg[0] == '-') {
-                            const slice = arg[1..];
-                            for (slice, 0..) |b, i| {
-                                if (b == 'h') {
+                        const kind = helpers.getKind(arg);
+                        switch (kind) {
+                            .long => {
+                                if (eql(u8, "--help", arg)) {
                                     try self.help(w);
                                 }
-                                if (b == 'V') {
+                                if (eql(u8, "--version", arg)) {
                                     try self.version(w);
                                 }
-                                inline for (comptimeState[0], comptimeState[1]) |arg_, sf| {
-                                    if (arg_.short and arg_.name[1] == b) {
-                                        if (arg_.type != .bool and i < slice.len - 1) {
-                                            return ZgraError.InvalidArgumentOrder;
+                                inline for (args, struct_fields) |arg_, sf| {
+                                    if (eql(u8, arg_.name, arg[2..])) {
+                                        switch (arg_.type) {
+                                            .bool => @field(self.template, sf.name) = true,
+                                            else => {
+                                                self.parser.currentArg = arg_;
+                                                self.parser.state = .value;
+                                            },
                                         }
-                                        if (arg_.type == .bool) {
-                                            @field(self.template, sf.name) = true;
-                                        } else {
-                                            self.parser.currentArg = arg_;
-                                            self.parser.state = .value;
+                                        break;
+                                    }
+                                }
+                            },
+                            .short => {
+                                const slice = arg[1..];
+                                for (slice, 0..) |b, i| {
+                                    if (b == 'h') {
+                                        try self.help(w);
+                                    }
+                                    if (b == 'V') {
+                                        try self.version(w);
+                                    }
+                                    inline for (args, struct_fields) |arg_, sf| {
+                                        if (arg_.short and arg_.name[1] == b) {
+                                            if (arg_.type != .bool and i < slice.len - 1) {
+                                                return ZgraError.InvalidArgumentOrder;
+                                            }
+                                            if (arg_.type == .bool) {
+                                                @field(self.template, sf.name) = true;
+                                            } else {
+                                                self.parser.currentArg = arg_;
+                                                self.parser.state = .value;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        } else {
-                            return ZgraError.UnknownArgument;
-                        }
-                    },
-                    .value => {
-                        if (self.parser.currentArg) |ca| {
-                            inline for (comptimeState[0], comptimeState[1]) |arg_, sf| {
-                                if (eql(u8, ca.name, arg_.name)) {
-                                    const argumentType = switch (@typeInfo(sf.type)) {
+                            },
+                            .pos => {
+                                if (index == null) {
+                                    return ZgraError.UnknownArgument;
+                                }
+                                self.parser.state = .positional;
+                                const arg_, const sf = .{ args[index.?], struct_fields[index.?] };
+                                switch (arg_.positional.?.kind) {
+                                    .many_one => {},
+                                    .many_zero => {},
+                                    .exact => |_| {},
+                                }
+                                try self.alist.append(alloc.*, out: {
+                                    const argument_type = switch (@typeInfo(sf.type)) {
                                         .optional => |o| o.child,
                                         else => sf.type,
                                     };
-                                    switch (argumentType) {
+                                    switch (argument_type) {
                                         [:0]const u8 => {
-                                            @field(self.template, sf.name) = arg;
+                                            break :out arg;
                                         },
                                         [:0]u8 => {
-                                            @field(self.template, sf.name) = @constCast(arg);
+                                            break :out @constCast(arg);
                                         },
-                                        []const u8 => @field(self.template, sf.name) = std.mem.span(arg.ptr),
-                                        []u8 => @field(self.template, sf.name) = @constCast(std.mem.span(arg.ptr)),
+                                        []const u8 => {
+                                            break :out std.mem.span(arg.ptr);
+                                        },
+                                        []u8 => {
+                                            break :out @constCast(std.mem.span(arg.ptr));
+                                        },
                                         i8, i16, i32, i64, i128 => {
-                                            @field(self.template, sf.name) = try std.fmt.parseInt(sf.type, arg, 10);
+                                            break :out try std.fmt.parseInt(sf.type, arg, 10);
                                         },
                                         f16, f32, f64, f80, f128 => {
-                                            @field(self.template, sf.name) = try std.fmt.parseFloat(sf.type, arg);
+                                            break :out try std.fmt.parseFloat(sf.type, arg);
                                         },
-                                        else => |t| switch (@typeInfo(t)) {
-                                            .@"enum" => {
-                                                var done = false;
+                                        else => |t| break :out switch (@typeInfo(t)) {
+                                            .@"enum" => out2: {
                                                 for (arg_.values.?, 0..) |enumField, i| {
                                                     if (eql(u8, enumField, arg)) {
-                                                        @field(self.template, sf.name) = @enumFromInt(i);
-                                                        done = true;
+                                                        break :out2 @enumFromInt(i);
                                                     }
                                                 }
-                                                if (!done) {
-                                                    return ZgraError.UnknownEnumVariant;
-                                                }
+                                                return ZgraError.UnsupportedFieldType;
                                             },
                                             else => return ZgraError.UnsupportedFieldType,
                                         },
                                     }
+                                });
+                                pos_arg_count += 1;
+                            },
+                        }
+                    },
+                    .value => {
+                        if (self.parser.currentArg) |ca| {
+                            inline for (args, struct_fields) |_, sf| {
+                                if (try helpers.parseValue(
+                                    &self.template,
+                                    arg,
+                                    ca,
+                                    sf,
+                                )) {
                                     self.parser.state = .arg;
                                     self.parser.currentArg = null;
                                 }
                             }
-                            continue;
                         }
-                        return ZgraError.UnknownArgument;
+                    },
+                    .positional => {
+                        if (index == null) {
+                            return ZgraError.UnknownArgument;
+                        }
+                        if (arg[0] == '-') {
+                            return ZgraError.OptionAfterPositional;
+                        }
+                        const arg_, const sf = .{ args[index.?], struct_fields[index.?] };
+                        try self.alist.append(alloc.*, out: {
+                            const argument_type = switch (@typeInfo(sf.type)) {
+                                .optional => |o| o.child,
+                                else => sf.type,
+                            };
+                            switch (argument_type) {
+                                [:0]const u8 => {
+                                    break :out arg;
+                                },
+                                [:0]u8 => {
+                                    break :out @constCast(arg);
+                                },
+                                []const u8 => {
+                                    break :out std.mem.span(arg.ptr);
+                                },
+                                []u8 => {
+                                    break :out @constCast(std.mem.span(arg.ptr));
+                                },
+                                i8, i16, i32, i64, i128 => {
+                                    break :out try std.fmt.parseInt(sf.type, arg, 10);
+                                },
+                                f16, f32, f64, f80, f128 => {
+                                    break :out try std.fmt.parseFloat(sf.type, arg);
+                                },
+                                else => |t| break :out switch (@typeInfo(t)) {
+                                    .@"enum" => out2: {
+                                        for (arg_.values.?, 0..) |enumField, i| {
+                                            if (eql(u8, enumField, arg)) {
+                                                break :out2 @enumFromInt(i);
+                                            }
+                                        }
+                                        return ZgraError.UnsupportedFieldType;
+                                    },
+                                    else => return ZgraError.UnsupportedFieldType,
+                                },
+                            }
+                        });
+                        pos_arg_count += 1;
                     },
                 }
             }
-            return self.template;
+            if (include_alist) {
+                switch (args[index.?].positional.?.kind) {
+                    .exact => |n| {
+                        if (n.n != pos_arg_count) {
+                            return ZgraError.WrongNumberOfArguments;
+                        }
+                    },
+                    .many_one => {
+                        if (pos_arg_count < 1) {
+                            return ZgraError.WrongNumberOfArguments;
+                        }
+                    },
+                    else => {},
+                }
+                return .{ self.template, try self.alist.toOwnedSlice(alloc.*) };
+            }
+            return .{self.template};
         }
 
-        // TODO: Use a nice formatting
         fn help(self: *@This(), w: *std.Io.Writer) !noreturn {
-            try w.print("Program:\n\t{s} {s}\nAbout:\n\t{s}\nUsage:\n\t{s} {s}\n", .{ self.meta.program, self.meta.version, self.meta.description, self.meta.program, self.meta.usage });
+            const positional = if (include_alist) comptime blk: {
+                switch (args[index.?].positional.?.kind) {
+                    .exact => |n| {
+                        var buf: [20]u8 = undefined;
+                        break :blk args[index.?].name ++ try std.fmt.bufPrint(&buf, "({d})", .{n.n});
+                    },
+                    .many_zero => {
+                        break :blk "[" ++ args[index.?].name ++ "]...";
+                    },
+                    .many_one => {
+                        break :blk args[index.?].name ++ "...";
+                    },
+                }
+            } else "";
+            try w.print(
+                "Program:\n\t{s} {s}\nAbout:\n\t{s}\nUsage:\n\t{s} {s} {s}\n",
+                .{ self.meta.program, self.meta.version, self.meta.description, self.meta.program, self.meta.usage, positional },
+            );
             try w.print("Arguments:\n", .{});
-            var maxLen: usize = 0;
-            maxLen = @max(std.fmt.count("-h, --help", .{}), maxLen);
-            maxLen = @max(std.fmt.count("-v, --version", .{}), maxLen);
+            var max_len: usize = 0;
+            max_len = @max(std.fmt.count("-h, --help", .{}), max_len);
+            max_len = @max(std.fmt.count("-v, --version", .{}), max_len);
 
-            for (comptimeState[0]) |arg| {
+            for (args) |arg| {
                 if (arg.skip) {
                     continue;
                 } else if (arg.short) {
-                    const argLen = std.fmt.count("-{c}, --{s}", .{ arg.name[1], arg.name[1..] });
+                    const arg_len = std.fmt.count("-{c}, --{s}", .{ arg.name[1], arg.name[1..] });
                     if (arg.values) |v| {
-                        var valLen: usize = 1;
+                        var val_len: usize = 1;
                         for (v, 0..) |value, i| {
-                            valLen += std.fmt.count("{s}", .{value});
+                            val_len += std.fmt.count("{s}", .{value});
                             if (i != v.len - 1) {
-                                valLen += std.fmt.count(" | ", .{});
+                                val_len += std.fmt.count(" | ", .{});
                             } else {
-                                valLen += std.fmt.count(")", .{});
+                                val_len += std.fmt.count(")", .{});
                             }
                         }
-                        maxLen = @max(argLen + valLen, maxLen);
+                        max_len = @max(arg_len + val_len, max_len);
                     } else {
-                        maxLen = @max(argLen, maxLen);
+                        max_len = @max(arg_len, max_len);
                     }
                 } else {
-                    const argLen = std.fmt.count("--{s}", .{arg.name});
+                    const arg_len = std.fmt.count("--{s}", .{arg.name});
                     if (arg.values) |v| {
-                        var valLen: usize = 1;
+                        var val_len: usize = 1;
                         for (v, 0..) |value, i| {
-                            valLen += std.fmt.count("{s}", .{value});
+                            val_len += std.fmt.count("{s}", .{value});
                             if (i != v.len - 1) {
-                                valLen += std.fmt.count(" | ", .{});
+                                val_len += std.fmt.count(" | ", .{});
                             } else {
-                                valLen += std.fmt.count(")", .{});
+                                val_len += std.fmt.count(")", .{});
                             }
                         }
-                        maxLen = @max(argLen + valLen, maxLen);
+                        max_len = @max(arg_len + val_len, max_len);
                     } else {
-                        maxLen = @max(argLen, maxLen);
+                        max_len = @max(arg_len, max_len);
                     }
                 }
             }
 
-            try w.print("\t{[value]s: <[width]}\tPrint this help message and exit.\n", .{ .value = "-h, --help", .width = maxLen });
-            try w.print("\t{[value]s: <[width]}\tPrint version information and exit.\n", .{ .value = "-v, --version", .width = maxLen });
-            for (comptimeState[0]) |arg| {
+            try w.print("\t{[value]s: <[width]}\tPrint this help message and exit.\n", .{ .value = "-h, --help", .width = max_len });
+            try w.print("\t{[value]s: <[width]}\tPrint version information and exit.\n", .{ .value = "-v, --version", .width = max_len });
+            for (args) |arg| {
                 var buff: [1024]u8 = undefined;
                 if (arg.skip) {
                     continue;
@@ -326,7 +439,7 @@ pub fn MakeParser(comptime Template: type, helpInfo: ZgraHelp) type {
                             }
                         }
                     }
-                    try w.print("\t{[buf]s: <[width]}", .{ .buf = buff[0..off], .width = maxLen });
+                    try w.print("\t{[buf]s: <[width]}", .{ .buf = buff[0..off], .width = max_len });
                 } else {
                     var off = (try std.fmt.bufPrint(&buff, "--{s}", .{arg.name})).len;
                     if (arg.values) |v| {
@@ -342,7 +455,7 @@ pub fn MakeParser(comptime Template: type, helpInfo: ZgraHelp) type {
                             }
                         }
                     }
-                    try w.print("\t{[val]s: <[width]}", .{ .val = buff[0..off], .width = maxLen });
+                    try w.print("\t{[val]s: <[width]}", .{ .val = buff[0..off], .width = max_len });
                 }
                 try w.print("\t{s}\n", .{arg.help});
             }
@@ -356,4 +469,160 @@ pub fn MakeParser(comptime Template: type, helpInfo: ZgraHelp) type {
             std.process.exit(0);
         }
     };
+}
+
+const helpers = struct {
+    const ArgKind = enum {
+        short,
+        long,
+        pos,
+    };
+
+    fn isPositionalName(comptime field: StructField) bool {
+        const s = enum {
+            name,
+            specifiers,
+            finished,
+        };
+        var state = s.name;
+        for (field.name, 0..) |b, i| {
+            switch (state) {
+                .name => {
+                    switch (b) {
+                        'A'...'Z' => {},
+                        ':' => {
+                            if (i > 0) {
+                                state = .specifiers;
+                            } else {
+                                return false;
+                            }
+                        },
+                        else => return false,
+                    }
+                },
+                .specifiers => {
+                    switch (b) {
+                        '0'...'9' => {},
+                        '+', '*' => state = .finished,
+                        else => return false,
+                    }
+                },
+                .finished => return false,
+            }
+        }
+        return true;
+    }
+
+    fn parsePositionalArgument(comptime field: StructField) struct { bool, [:0]const u8, PosKind, type } {
+        if (!isPositionalName(field)) {
+            return .{ false, field.name, .many_one, field.type };
+        }
+        var sep_index: usize = 0;
+        for (field.name, 0..) |b, i| {
+            if (b == ':') {
+                sep_index = i;
+                break;
+            }
+        }
+        const t = field.type;
+
+        const y = field.name[0..sep_index] ++ .{0};
+        const name = y[0..sep_index :0];
+        const special = field.name[sep_index + 1 ..];
+        switch (special[0]) {
+            '*' => return .{ true, name, .many_zero, t },
+            '+' => return .{ true, name, .many_one, t },
+            else => |x| {
+                if (std.ascii.isDigit(x)) {
+                    return .{ true, name, .{ .exact = .{ .n = try std.fmt.parseUnsigned(usize, special[0..], 10) } }, t };
+                }
+            },
+        }
+        @compileLog("name: {any}\n", .{field.name});
+        return .{ false, field.name, .many_zero, field.type };
+    }
+
+    fn getKind(arg: [:0]const u8) ArgKind {
+        if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') return .long;
+        if (arg.len > 1 and arg[0] == '-') return .short;
+        return .pos;
+    }
+
+    fn parseValue(
+        s: anytype,
+        arg: [:0]const u8,
+        ca: Arg,
+        sf: StructField,
+    ) !bool {
+        if (eql(u8, ca.name, sf.name)) {
+            const argument_type = switch (@typeInfo(sf.type)) {
+                .optional => |o| o.child,
+                else => sf.type,
+            };
+            switch (argument_type) {
+                [:0]const u8 => {
+                    @field(s, sf.name) = arg;
+                },
+                [:0]u8 => {
+                    @field(s, sf.name) = @constCast(arg);
+                },
+                []const u8 => @field(s, sf.name) = std.mem.span(arg.ptr),
+                []u8 => @field(s, sf.name) = @constCast(std.mem.span(arg.ptr)),
+                i8, i16, i32, i64, i128 => {
+                    @field(s, sf.name) = try std.fmt.parseInt(sf.type, arg, 10);
+                },
+                f16, f32, f64, f80, f128 => {
+                    @field(s, sf.name) = try std.fmt.parseFloat(sf.type, arg);
+                },
+                else => |t| switch (@typeInfo(t)) {
+                    .@"enum" => {
+                        var done = false;
+                        for (ca.values.?, 0..) |enumField, i| {
+                            if (eql(u8, enumField, arg)) {
+                                @field(s, sf.name) = @enumFromInt(i);
+                                done = true;
+                            }
+                        }
+                        if (!done) {
+                            return ZgraError.UnknownEnumVariant;
+                        }
+                    },
+                    else => return ZgraError.UnsupportedFieldType,
+                },
+            }
+            return true;
+        }
+        return false;
+    }
+
+    fn parseMetaArg(meta: *ZgraMeta, f: StructField) bool {
+        if (f.name.len > 2 and f.name[0] == '_' and f.name[1] == '_') {
+            const choices = std.meta.stringToEnum(enum {
+                __usage,
+                __version,
+                __program,
+                __desc,
+            }, f.name) orelse @compileError("not a supported metadata field" ++ f.name ++ "; field names starting with '__' are reserved");
+            switch (choices) {
+                .__desc => meta.description = f.defaultValue().?,
+                .__version => meta.version = f.defaultValue().?,
+                .__usage => meta.usage = f.defaultValue().?,
+                .__program => meta.program = f.defaultValue().?,
+            }
+            return true;
+        }
+        return false;
+    }
+};
+
+test "arrayinfo" {
+    const A = [7][:0]const u8;
+    const type_info = @typeInfo(A);
+    const array = switch (type_info) {
+        .pointer => |p| p,
+        .array => |a| a,
+        else => @compileError("not a slice or a pointer"),
+    };
+
+    std.debug.print("{any}\n", .{array});
 }
