@@ -494,7 +494,7 @@ const helpers = struct {
                             if (i > 0) {
                                 state = .specifiers;
                             } else {
-                                return false;
+                                @compileError("separator ':' in first place");
                             }
                         },
                         else => return false,
@@ -504,10 +504,10 @@ const helpers = struct {
                     switch (b) {
                         '0'...'9' => {},
                         '+', '*' => state = .finished,
-                        else => return false,
+                        else => @compileError("invalid byte '" ++ .{b} ++ "' in field: " ++ field.name),
                     }
                 },
-                .finished => return false,
+                .finished => @compileError("multiple terminating characters"),
             }
         }
         return true;
