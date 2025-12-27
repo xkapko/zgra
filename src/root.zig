@@ -307,6 +307,12 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                     true => (print("-{c}, --{s}", .{ arg.name[1], arg.name[1..] })).len,
                     else => (print("--{s}", .{arg.name})).len,
                 };
+                arg_len += switch (arg.type) {
+                    .float => 5,
+                    .str, .int => 3,
+                    .uint => 4,
+                    else => 0,
+                } + 1; // +1 is for the space
 
                 if (arg.values) |v| {
                     comptime var val_len = 1;
@@ -353,12 +359,20 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                 if (arg.skip) {
                     continue;
                 }
-                comptime var flags: [:0]const u8 = switch (arg.short) {
+                comptime var current_arg: [:0]const u8 = switch (arg.short) {
                     true => print("-{c}, --{s}", .{ arg.name[1], arg.name[1..] }),
                     else => print("--{s}", .{arg.name}),
                 };
+                current_arg = current_arg ++ switch (arg.type) {
+                    .str => " STR",
+                    .int => " INT",
+                    .uint => " UINT",
+                    .float => " FLOAT",
+                    else => "",
+                };
 
                 if (arg.values) |v| {
+                    current_arg = current_arg ++ " ";
                     inline for (v, 0..) |value, i| {
                         comptime var flag: [:0]const u8 = if (i == 0) "(" else "";
 
@@ -369,10 +383,10 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                             else => flag = flag ++ print(")", .{}),
                         }
 
-                        flags = flags ++ flag;
+                        current_arg = current_arg ++ flag;
                     }
                 }
-                arg_slice = arg_slice ++ print("\t{[buf]s: <[width]}", .{ .buf = flags, .width = max_len });
+                arg_slice = arg_slice ++ print("\t{[buf]s: <[width]}", .{ .buf = current_arg, .width = max_len });
                 arg_slice = arg_slice ++ print("\t{s}\n", .{arg.help});
             }
 
