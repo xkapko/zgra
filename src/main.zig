@@ -3,7 +3,7 @@ const zgra = @import("zgra");
 
 const Args = struct {
     __program: []const u8 = "zgra_showcase",
-    __usage: []const u8 = "[-o [value] | --option [value]]",
+    __usage: []const u8 = "[-o [value] | --option [value]...]",
     __desc: []const u8 = "showcase of the zgra zig command line argument parsing library",
     __version: []const u8 = "v0.0.1",
     int: i128 = 0,

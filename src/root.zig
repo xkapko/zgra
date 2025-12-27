@@ -3,6 +3,7 @@ const Type = std.builtin.Type;
 const StructField = std.builtin.Type.StructField;
 const EnumField = std.builtin.Type.EnumField;
 const eql = std.mem.eql;
+const print = std.fmt.comptimePrint;
 
 pub const ZgraError = error{
     UnsupportedFieldType,
@@ -69,9 +70,11 @@ const Parser = struct {
 };
 
 /// Given a type and a help structure, create a new command line argument parser at compile time. After creating the
-/// parsers, the user needs to instantiate it with the default values and then call the `.parse()` method on the
+/// parser, the user needs to instantiate it with the default values and then call the `.parse()` method on the
 /// instance. The returned value is the initial type with with the values of each field matching the ones received from
 /// parsing.
+///
+/// The default return type of the `parse()` function is
 pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
     const template_type_info = @typeInfo(Template);
     const info = switch (template_type_info) {
@@ -85,21 +88,18 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
         var metadata: ZgraMeta = .{};
         var positional_index: ?usize = null;
         var positional_type: ?type = null;
-        for (
-            info.fields,
-            0..,
-        ) |f, i| {
-            const field_type_info = @typeInfo(f.type);
+        for (info.fields, 0..) |field, i| {
+            const field_type_info = @typeInfo(field.type);
 
-            const is_positional, const name, const kind, const field_type = helpers.parsePositionalArgument(f);
+            const is_positional, const name, const kind, const field_type = helpers.tryParsePositionalArgument(field);
             if (is_positional and positional_index == null) {
                 positional_index = i;
                 positional_type = field_type;
             } else if (is_positional and positional_index != null) {
-                @compileError("more than one positional argumet is not allowed");
+                @compileError("multiple positional arguments are forbidden");
             }
 
-            const skip = helpers.parseMetaArg(&metadata, f);
+            const should_skip = helpers.tryParseMetaArg(&metadata, field);
 
             const arg_type = switch (field_type) {
                 bool => .bool,
@@ -111,40 +111,40 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                     .@"enum" => .enume,
                     else => |x| {
                         @compileLog("unsupported struct field type: {any}", .{x});
-                        @compileError("unsupported field type");
+                        @compileError("unsupported Template field type");
                     },
                 },
             };
 
             const values = switch (field_type_info) {
                 .@"enum" => |e| enfields: {
-                    const efields = blk: {
-                        var tmp: [e.fields.len][:0]const u8 = undefined;
+                    const enum_fields = blk: {
+                        var temp_enum_fields: [e.fields.len][:0]const u8 = undefined;
                         for (e.fields, 0..) |ef, ii| {
-                            tmp[ii] = ef.name;
+                            temp_enum_fields[ii] = ef.name;
                         }
-                        break :blk tmp;
+                        break :blk temp_enum_fields;
                     };
-                    break :enfields &efields;
+                    break :enfields &enum_fields;
                 },
                 else => null,
             };
 
             args[i] = Arg{
-                .name = if (is_positional) name else f.name,
+                .name = if (is_positional) name else field.name,
                 .type = arg_type,
-                .short = f.name[0] == '_',
-                .skip = skip or is_positional,
-                .help = switch (skip or is_positional) {
+                .short = field.name[0] == '_',
+                .skip = should_skip or is_positional,
+                .help = switch (should_skip or is_positional) {
                     true => "",
-                    else => @constCast(@field(helpInfo, f.name)),
+                    else => @constCast(@field(helpInfo, field.name)),
                 },
                 .values = values,
                 .positional = if (is_positional) .{
                     .kind = kind,
                 } else null,
             };
-            template_fields[i] = f;
+            template_fields[i] = field;
         }
         break :make_state .{
             args,
@@ -166,6 +166,7 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
         else
             void = if (include_alist) .empty else {},
 
+        /// Parse the command line arguments.
         pub fn parse(self: *@This(), it: *std.process.ArgIterator, w: *std.Io.Writer, alloc: *std.mem.Allocator) return_type {
             // skip program name
             var pos_arg_count: usize = 0;
@@ -175,80 +176,28 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                     .arg => {
                         const kind = helpers.getKind(arg);
                         switch (kind) {
-                            .long => {
-                                if (eql(u8, "--help", arg)) {
-                                    try self.help(w);
-                                }
-                                if (eql(u8, "--version", arg)) {
-                                    try self.version(w);
-                                }
-                                inline for (args, struct_fields) |arg_, sf| {
-                                    if (eql(u8, arg_.name, arg[2..])) {
-                                        switch (arg_.type) {
-                                            .bool => @field(self.template, sf.name) = true,
-                                            else => {
-                                                self.parser.currentArg = arg_;
-                                                self.parser.state = .value;
-                                            },
-                                        }
-                                        break;
-                                    }
-                                }
-                            },
-                            .short => {
-                                const slice = arg[1..];
-                                for (slice, 0..) |b, i| {
-                                    switch (b) {
-                                        'h' => try self.help(w),
-                                        'V' => try self.version(w),
-                                        else => {
-                                            inline for (args, struct_fields) |arg_, sf| {
-                                                if (arg_.short and arg_.name[1] == b) {
-                                                    if (arg_.type != .bool and i < slice.len - 1) {
-                                                        return ZgraError.InvalidArgumentOrder;
-                                                    }
-                                                    switch (arg_.type) {
-                                                        .bool => @field(self.template, sf.name) = true,
-                                                        else => {
-                                                            if (self.parser.currentArg != null) {
-                                                                return ZgraError.InvalidArgumentOrder;
-                                                            }
-                                                            self.parser.currentArg = arg_;
-                                                            self.parser.state = .value;
-                                                        },
-                                                    }
-                                                }
-                                            }
-                                        },
-                                    }
-                                }
-                            },
+                            .long => try self.long(arg, w),
+                            .short => try self.short(arg, w),
                             .pos => {
+                                self.parser.state = .positional;
                                 if (index == null) {
                                     return ZgraError.UnknownArgument;
                                 }
-                                self.parser.state = .positional;
-                                const arg_, const sf = .{ args[index.?], struct_fields[index.?] };
-                                try self.alist.append(alloc.*, out: {
-                                    const Value = helpers.ValueParser(sf.type);
-                                    break :out try Value.parse(arg, arg_.values);
-                                });
-                                pos_arg_count += 1;
+                                pos_arg_count += try self.pos(arg, alloc);
                             },
                         }
                     },
                     .value => {
-                        if (self.parser.currentArg) |ca| {
-                            inline for (args, struct_fields) |_, sf| {
-                                if (try helpers.setValue(
-                                    &self.template,
-                                    arg,
-                                    ca,
-                                    sf,
-                                )) {
-                                    self.parser.state = .arg;
-                                    self.parser.currentArg = null;
-                                }
+                        const ca = self.parser.currentArg.?;
+                        inline for (args, struct_fields) |_, sf| {
+                            if (try helpers.setValue(
+                                &self.template,
+                                arg,
+                                ca,
+                                sf,
+                            )) {
+                                self.parser.state = .arg;
+                                self.parser.currentArg = null;
                             }
                         }
                     },
@@ -259,12 +208,7 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                         if (arg[0] == '-') {
                             return ZgraError.InvalidArgumentOrder;
                         }
-                        const arg_, const sf = .{ args[index.?], struct_fields[index.?] };
-                        try self.alist.append(alloc.*, out: {
-                            const Value = helpers.ValueParser(sf.type);
-                            break :out try Value.parse(arg, arg_.values);
-                        });
-                        pos_arg_count += 1;
+                        pos_arg_count += try self.pos(arg, alloc);
                     },
                 }
             }
@@ -287,68 +231,122 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
             return .{self.template};
         }
 
-        fn generateHelp() [:0]const u8 {
-            const print = std.fmt.comptimePrint;
-            const positional = if (include_alist) blk: {
-                switch (args[index.?].positional.?.kind) {
-                    .exact => |n| {
-                        var buf: [20]u8 = undefined;
-                        break :blk args[index.?].name ++ try std.fmt.bufPrint(&buf, "({d})", .{n.n});
-                    },
-                    .many_zero => {
-                        break :blk "[" ++ args[index.?].name ++ "]...";
-                    },
-                    .many_one => {
-                        break :blk args[index.?].name ++ "...";
+        /// Used to parse a long optional argument.
+        fn long(self: *@This(), arg: [:0]const u8, w: *std.Io.Writer) !void {
+            if (eql(u8, "--help", arg)) {
+                try self.help(w);
+            }
+            if (eql(u8, "--version", arg)) {
+                try self.version(w);
+            }
+            inline for (args, struct_fields) |arg_, sf| {
+                if (eql(u8, arg_.name, arg[2..])) {
+                    switch (arg_.type) {
+                        .bool => @field(self.template, sf.name) = true,
+                        else => {
+                            self.parser.currentArg = arg_;
+                            self.parser.state = .value;
+                        },
+                    }
+                    return;
+                }
+            }
+        }
+
+        /// Used to parse short optional arguments.
+        fn short(self: *@This(), arg: [:0]const u8, w: *std.Io.Writer) !void {
+            for (arg[1..], 0..) |b, i| {
+                switch (b) {
+                    'h' => try self.help(w),
+                    'V' => try self.version(w),
+                    else => {
+                        inline for (args, struct_fields) |arg_, sf| {
+                            if (arg_.short and arg_.name[1] == b) {
+                                if (arg_.type != .bool and i < arg[1..].len - 1) {
+                                    return ZgraError.InvalidArgumentOrder;
+                                }
+                                switch (arg_.type) {
+                                    .bool => @field(self.template, sf.name) = true,
+                                    else => {
+                                        if (self.parser.currentArg != null) {
+                                            return ZgraError.InvalidArgumentOrder;
+                                        }
+                                        self.parser.currentArg = arg_;
+                                        self.parser.state = .value;
+                                    },
+                                }
+                            }
+                        }
                     },
                 }
-            } else "";
-            const header = print(
-                "Program:\n\t{s} {s}\nAbout:\n\t{s}\nUsage:\n\t{s} {s} {s}\n",
-                .{ metadata.program, metadata.version, metadata.description, metadata.program, metadata.usage, positional },
-            ) ++ "Arguments:\n";
+            }
+        }
 
-            comptime var max_len = 0;
-            comptime var arg_slice: [:0]const u8 = undefined;
-            max_len = @max(comptime b: {
-                break :b std.fmt.count("-h, --help", .{});
-            }, max_len);
-            max_len = @max(comptime b: {
-                break :b std.fmt.count("-v, --version", .{});
-            }, max_len);
+        /// Used to parse a positional argument.
+        fn pos(self: *@This(), arg: [:0]const u8, alloc: *std.mem.Allocator) !usize {
+            const arg_, const sf = .{ args[index.?], struct_fields[index.?] };
+            try self.alist.append(alloc.*, out: {
+                const Value = helpers.ValueParser(sf.type);
+                break :out try Value.parse(arg, arg_.values);
+            });
+            return 1;
+        }
+
+        /// Count the maximum width of the longest option.
+        fn helpMaxWidth() comptime_int {
+            // "-V, --version".len == 13
+            comptime var max_len = 13;
 
             inline for (args) |arg| {
                 comptime var arg_len = 0;
                 if (arg.skip) {
                     continue;
                 }
-                switch (arg.short) {
-                    true => arg_len = comptime b: {
-                        break :b std.fmt.count("-{c}, --{s}", .{ arg.name[1], arg.name[1..] });
-                    },
-                    else => arg_len = comptime b: {
-                        break :b std.fmt.count("--{s}", .{arg.name});
-                    },
-                }
+
+                arg_len = switch (arg.short) {
+                    true => (print("-{c}, --{s}", .{ arg.name[1], arg.name[1..] })).len,
+                    else => (print("--{s}", .{arg.name})).len,
+                };
 
                 if (arg.values) |v| {
                     comptime var val_len = 1;
-                    inline for (v, 0..) |value, i| {
-                        val_len += comptime b: {
-                            break :b std.fmt.count("{s}", .{value});
-                        };
-                        if (i != v.len - 1) {
-                            val_len += 3;
-                        } else {
-                            val_len += 1;
-                        }
+                    inline for (v) |value| {
+                        // "{value} | "
+                        val_len += value.len + 3;
                     }
+                    // last value ends with ")", so we subtract 2 here
+                    val_len -= 2;
                     max_len = @max(arg_len + val_len, max_len);
                 } else {
                     max_len = @max(arg_len, max_len);
                 }
             }
+            return max_len;
+        }
 
+        /// Used to generate the help message string at compile time.
+        fn generateHelp() [:0]const u8 {
+            const positional: [:0]const u8 = if (include_alist) switch (args[index.?].positional.?.kind) {
+                .exact => |n| print("{s}({d})", .{ args[index.?].name, n.n }),
+                .many_zero => print("[{s}]...", .{args[index.?].name}),
+                .many_one => print("{s}...", .{args[index.?].name ++ "..."}),
+            } else "";
+            const header = print(
+                \\Program:
+                \\        {s} {s}
+                \\About:
+                \\        {s}
+                \\Usage:
+                \\        {s} {s} {s}
+                \\Options:
+                \\
+            ,
+                .{ metadata.program, metadata.version, metadata.description, metadata.program, metadata.usage, positional },
+            );
+
+            const max_len = helpMaxWidth();
+
+            comptime var arg_slice: [:0]const u8 = undefined;
             arg_slice = print("\t{[value]s: <[width]}\tPrint this help message and exit.\n", .{ .value = "-h, --help", .width = max_len });
             arg_slice = arg_slice ++ print("\t{[value]s: <[width]}\tPrint version information and exit.\n", .{ .value = "-v, --version", .width = max_len });
             inline for (args) |arg| {
@@ -362,18 +360,15 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
 
                 if (arg.values) |v| {
                     inline for (v, 0..) |value, i| {
-                        comptime var flag: [:0]const u8 = undefined;
-                        if (i == 0) {
-                            flag = print("(", .{});
-                        } else {
-                            flag = "";
-                        }
+                        comptime var flag: [:0]const u8 = if (i == 0) "(" else "";
+
                         flag = flag ++ print("{s}", .{value});
-                        if (i != v.len - 1) {
-                            flag = flag ++ print(" | ", .{});
-                        } else {
-                            flag = flag ++ print(")", .{});
+
+                        switch (i != v.len - 1) {
+                            true => flag = flag ++ print(" | ", .{}),
+                            else => flag = flag ++ print(")", .{}),
                         }
+
                         flags = flags ++ flag;
                     }
                 }
@@ -384,14 +379,15 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
             return header ++ arg_slice;
         }
 
+        /// Write the generated help message to the provided writer.
         fn help(self: *@This(), w: *std.Io.Writer) !noreturn {
             _ = self;
-            const h = generateHelp();
-            try w.print("{s}", .{h});
+            try w.print("{s}", .{generateHelp()});
             try w.flush();
             std.process.exit(0);
         }
 
+        /// Write the version to the provided writer.
         fn version(self: *@This(), w: *std.Io.Writer) !noreturn {
             try w.print("{s}\n", .{self.meta.version});
             try w.flush();
@@ -407,6 +403,7 @@ const helpers = struct {
         pos,
     };
 
+    /// Check whether a `StructField` name identifies a valid positional argument.
     fn isPositionalName(comptime field: StructField) bool {
         const s = enum {
             name,
@@ -442,7 +439,8 @@ const helpers = struct {
         return true;
     }
 
-    fn parsePositionalArgument(comptime field: StructField) struct { bool, [:0]const u8, PosKind, type } {
+    /// Try to parse a structure fields as a positional argument.
+    fn tryParsePositionalArgument(comptime field: StructField) struct { bool, [:0]const u8, PosKind, type } {
         if (!isPositionalName(field)) {
             return .{ false, field.name, .many_one, field.type };
         }
@@ -453,30 +451,30 @@ const helpers = struct {
                 break;
             }
         }
-        const t = field.type;
+        const field_type = field.type;
 
-        const y = field.name[0..sep_index] ++ .{0};
-        const name = y[0..sep_index :0];
+        const name = (field.name[0..sep_index] ++ .{0})[0..sep_index :0];
         const special = field.name[sep_index + 1 ..];
         switch (special[0]) {
-            '*' => return .{ true, name, .many_zero, t },
-            '+' => return .{ true, name, .many_one, t },
+            '*' => return .{ true, name, .many_zero, field_type },
+            '+' => return .{ true, name, .many_one, field_type },
             else => |x| {
                 if (std.ascii.isDigit(x)) {
-                    return .{ true, name, .{ .exact = .{ .n = try std.fmt.parseUnsigned(usize, special[0..], 10) } }, t };
+                    return .{ true, name, .{ .exact = .{ .n = try std.fmt.parseUnsigned(usize, special[0..], 10) } }, field_type };
                 }
             },
         }
-        @compileLog("name: {any}\n", .{field.name});
         return .{ false, field.name, .many_zero, field.type };
     }
 
+    /// Get the kind of a command line argument.
     fn getKind(arg: [:0]const u8) ArgKind {
         if (arg.len > 2 and arg[0] == '-' and arg[1] == '-') return .long;
         if (arg.len > 1 and arg[0] == '-') return .short;
         return .pos;
     }
 
+    /// Set the value of the Template structure after parsing an argument.
     fn setValue(
         s: anytype,
         arg: [:0]const u8,
@@ -490,7 +488,8 @@ const helpers = struct {
         return false;
     }
 
-    fn parseMetaArg(meta: *ZgraMeta, f: StructField) bool {
+    /// Try to parse a structure field for program metadata.
+    fn tryParseMetaArg(meta: *ZgraMeta, f: StructField) bool {
         if (f.name.len > 2 and f.name[0] == '_' and f.name[1] == '_') {
             const choices = std.meta.stringToEnum(enum {
                 __usage,
@@ -509,6 +508,7 @@ const helpers = struct {
         return false;
     }
 
+    /// Returns a structure with a single function for parsing a null-terminated slice into the appropriate type.
     fn ValueParser(comptime T: type) type {
         return struct {
             fn parse(value: [:0]const u8, enum_values: ?[]const [:0]const u8) ZgraError!T {
