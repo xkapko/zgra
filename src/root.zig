@@ -154,7 +154,7 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
             positional_type,
         };
     };
-    const return_type = if (pos_type == null) ZgraError!struct { Template } else ZgraError!struct { Template, []pos_type.? };
+    const return_type = if (pos_type == null) ZgraError!Template else ZgraError!struct { Template, []pos_type.? };
     const include_alist = pos_type != null;
 
     return struct {
@@ -241,13 +241,7 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
             }
             inline for (args, struct_fields) |arg_, sf| {
                 if (eql(u8, arg_.name, arg[2..])) {
-                    switch (arg_.type) {
-                        .bool => @field(self.template, sf.name) = true,
-                        else => {
-                            self.parser.currentArg = arg_;
-                            self.parser.state = .value;
-                        },
-                    }
+                    try self.tryParseFlag(arg_, sf);
                     return;
                 }
             }
@@ -259,26 +253,33 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                 switch (b) {
                     'h' => try self.help(w),
                     'V' => try self.version(w),
-                    else => {
-                        inline for (args, struct_fields) |arg_, sf| {
-                            if (arg_.short and arg_.name[1] == b) {
-                                if (arg_.type != .bool and i < arg[1..].len - 1) {
-                                    return ZgraError.InvalidArgumentOrder;
-                                }
-                                switch (arg_.type) {
-                                    .bool => @field(self.template, sf.name) = true,
-                                    else => {
-                                        if (self.parser.currentArg != null) {
-                                            return ZgraError.InvalidArgumentOrder;
-                                        }
-                                        self.parser.currentArg = arg_;
-                                        self.parser.state = .value;
-                                    },
-                                }
-                            }
-                        }
-                    },
+                    else => {},
                 }
+                inline for (args, struct_fields) |arg_, sf| {
+                    if (arg_.short and arg_.name[1] == b) {
+                        // non-flags are only allowed in the last position of compound short arguments
+                        if (arg_.type != .bool and i < arg[1..].len - 1) {
+                            return ZgraError.InvalidArgumentOrder;
+                        }
+                        try self.tryParseFlag(arg_, sf);
+                        return;
+                    }
+                }
+            }
+        }
+
+        /// Try to parse a flag argument, if the argument is not a flag, switch the state to parse a value in the next
+        /// argument.
+        inline fn tryParseFlag(self: *@This(), arg: Arg, sf: StructField) !void {
+            switch (arg.type) {
+                .bool => @field(self.template, sf.name) = true,
+                else => {
+                    if (self.parser.currentArg != null) {
+                        return ZgraError.InvalidArgumentOrder;
+                    }
+                    self.parser.currentArg = arg;
+                    self.parser.state = .value;
+                },
             }
         }
 
