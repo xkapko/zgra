@@ -14,6 +14,28 @@
 - Automatic `--help` and `--version` output generation.
 - Efficiency: everything that can be generated at `comptime`, is generate at `comptime`.
 
+# Installation
+
+Fetch the library by running:
+
+```sh
+zig fetch --save git+https://github.com/xkapko/zgra
+```
+
+Add the following lines to `build.zig`:
+
+```zig
+const zgra = b.dependency(
+    "zgra",
+    .{
+        .target = target,
+        .optimize = optimize,
+    },
+);
+
+exe.root_module.addImport("zgra", zgra.module("zgra"));
+```
+
 # API
 
 ## 1. The argument structure
