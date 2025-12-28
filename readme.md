@@ -98,16 +98,16 @@ const Arg = struct {
 };
 ```
 
-### 3. `MakeParser`
+## 3. `MakeParser`
 
 The `zgra.MakeParser` function is used to create a new `Parser` type. The function requires two arguments, the template structure we defined earlier and an anonymous `struct` with field names matching the field names of the template structure. The values of the anonymous structure should be strings. They are used as help comments for automatically generating the help messages. **The help structure and the help fields are required**.
 
 
-### 4. Parse method
+## 4. Parse method
 
 Calling `MakeParser` returns a new type. The user instantiates it with the default values of the template structure. After that, the user can call the `.parse()` method which takes the following arguments:
 
-1. command line argument iterator: `std.process.ArgIterator`
+1. command line argument iterator pointer: `*std.process.ArgIterator`
 2. a writer pointer, for automatically writing out the help and version messages: `*std.Io.Writer`
 3. an allocator pointer: `*std.mem.Allocator` which is only used when allocating positional arguments.
 
