@@ -4,6 +4,7 @@ const StructField = std.builtin.Type.StructField;
 const EnumField = std.builtin.Type.EnumField;
 const eql = std.mem.eql;
 const print = std.fmt.comptimePrint;
+const arguments = @import("arguments.zig");
 
 pub const ZgraError = error{
     UnsupportedFieldType,
@@ -26,13 +27,13 @@ const PosKind = union(enum) {
     many_one,
 };
 
-const ArgType = enum {
+const ArgType = union(enum) {
     bool,
     int,
     uint,
     float,
     str,
-    enume,
+    enum_: []const [:0]const u8,
 };
 
 /// Inner representation of a parsed command line argument.
@@ -41,7 +42,6 @@ const Arg = struct {
     name: [:0]const u8,
     // type of the argument, used for parsing
     type: ArgType,
-    values: ?[]const [:0]const u8 = null,
     short: bool,
     skip: bool,
     help: []u8 = "",
@@ -101,21 +101,6 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
 
             const should_skip = helpers.tryParseMetaArg(&metadata, field);
 
-            const arg_type = switch (field_type) {
-                bool => .bool,
-                i8, i16, i32, i64, i128, isize => .int,
-                u8, u16, u32, u64, u128, usize => .uint,
-                []const u8, []u8, [:0]const u8, [:0]u8 => .str,
-                f16, f32, f64, f80, f128 => .float,
-                else => switch (field_type_info) {
-                    .@"enum" => .enume,
-                    else => |x| {
-                        @compileLog("unsupported struct field type: {any}", .{x});
-                        @compileError("unsupported Template field type");
-                    },
-                },
-            };
-
             const values = switch (field_type_info) {
                 .@"enum" => |e| enfields: {
                     const enum_fields = blk: {
@@ -130,6 +115,21 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                 else => null,
             };
 
+            const arg_type = switch (field_type) {
+                bool => .bool,
+                i8, i16, i32, i64, i128, isize => .int,
+                u8, u16, u32, u64, u128, usize => .uint,
+                []const u8, []u8, [:0]const u8, [:0]u8 => .str,
+                f16, f32, f64, f80, f128 => .float,
+                else => switch (field_type_info) {
+                    .@"enum" => ArgType{ .enum_ = values },
+                    else => |x| {
+                        @compileLog("unsupported struct field type: {any}", .{x});
+                        @compileError("unsupported Template field type");
+                    },
+                },
+            };
+
             args[i] = Arg{
                 .name = if (is_positional) name else field.name,
                 .type = arg_type,
@@ -139,7 +139,6 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                     true => "",
                     else => @constCast(@field(helpInfo, field.name)),
                 },
-                .values = values,
                 .positional = if (is_positional) .{
                     .kind = kind,
                 } else null,
@@ -288,7 +287,7 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
             const arg_, const sf = .{ args[index.?], struct_fields[index.?] };
             try self.alist.append(alloc.*, out: {
                 const Value = helpers.ValueParser(sf.type);
-                break :out try Value.parse(arg, arg_.values);
+                break :out try Value.parse(arg, if (arg_.type == .enum_) arg_.type.enum_ else null);
             });
             return 1;
         }
@@ -315,9 +314,9 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                     else => 0,
                 } + 1; // +1 is for the space
 
-                if (arg.values) |v| {
+                if (arg.type == .enum_) {
                     comptime var val_len = 1;
-                    inline for (v) |value| {
+                    inline for (arg.type.enum_) |value| {
                         // "{value} | "
                         val_len += value.len + 3;
                     }
@@ -372,14 +371,14 @@ pub fn MakeParser(comptime Template: type, helpInfo: anytype) type {
                     else => "",
                 };
 
-                if (arg.values) |v| {
+                if (arg.type == .enum_) {
                     current_arg = current_arg ++ " ";
-                    inline for (v, 0..) |value, i| {
+                    inline for (arg.type.enum_, 0..) |value, i| {
                         comptime var flag: [:0]const u8 = if (i == 0) "(" else "";
 
                         flag = flag ++ print("{s}", .{value});
 
-                        switch (i != v.len - 1) {
+                        switch (i != arg.type.enum_.len - 1) {
                             true => flag = flag ++ print(" | ", .{}),
                             else => flag = flag ++ print(")", .{}),
                         }
@@ -498,7 +497,7 @@ const helpers = struct {
     ) !bool {
         if (eql(u8, ca.name, sf.name)) {
             const ValParser = ValueParser(sf.type);
-            @field(s, sf.name) = try ValParser.parse(arg, ca.values);
+            @field(s, sf.name) = try ValParser.parse(arg, if (ca.type == .enum_) ca.type.enum_ else null);
         }
         return false;
     }
@@ -550,3 +549,7 @@ const helpers = struct {
         };
     }
 };
+
+test {
+    _ = @import("arguments.zig");
+}
